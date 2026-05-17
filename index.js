@@ -1,9 +1,16 @@
 require('dotenv').config();
 const cloudscraper = require('cloudscraper');
 const { v4: uuidv4 } = require('uuid');
+const WebSocket = require('ws');
 
-// Extension ID tetap (disimpan sekali selama proses berjalan)
-const DAWN_EXTENSION_ID = uuidv4();
+// IDs tetap selama proses berjalan
+const DAWN_EXTENSION_ID  = uuidv4();
+const GRASS_BROWSER_ID   = uuidv4();
+const GRASS_EXTENSION_ID = 'ilehaonighjijnmpnagapkhpcdbhclfg';
+const GRASS_VERSION      = '6.1.3';
+const GRASS_UA           = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36';
+const GRASS_PING_MS      = 120000; // 2 menit — sama dengan ekstensi resmi
+const GRASS_DEAD_MS      = 129000; // 129 detik tanpa pesan → reconnect
 
 // Konfigurasi dari .env
 const CONFIG = {
@@ -172,6 +179,140 @@ async function getGrassEpochEarnings() {
     return data && data.length > 0 ? data[0] : null;
   } catch (error) {
     throw new Error(`Grass EpochEarnings Failed: ${error.message}`);
+  }
+}
+
+// ============================================================
+//  GRASS NODE (WebSocket — earn uptime points)
+// ============================================================
+
+let grassWs          = null;
+let grassLastMsg     = 0;
+let grassPingTimer   = null;
+let grassReconnTimer = null;
+
+function decodeGrassUserId() {
+  try {
+    const payload = CONFIG.grassAuthToken.split('.')[1];
+    const decoded = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    return decoded.userId || null;
+  } catch {
+    return null;
+  }
+}
+
+async function grassCheckin() {
+  const userId = decodeGrassUserId();
+  if (!userId) throw new Error('Tidak bisa decode userId dari GRASS_AUTH_TOKEN');
+  const response = await cloudscraper.post('https://director.getgrass.io/checkin', {
+    headers: {
+      ...baseHeaders,
+      'Content-Type': 'application/json',
+      'Accept': '*/*',
+      'Origin': `chrome-extension://${GRASS_EXTENSION_ID}`,
+      'Sec-Fetch-Site': 'none'
+    },
+    json: true,
+    body: {
+      browserId:   GRASS_BROWSER_ID,
+      userId:      userId,
+      version:     GRASS_VERSION,
+      extensionId: GRASS_EXTENSION_ID,
+      userAgent:   GRASS_UA,
+      deviceType:  'extension'
+    }
+  });
+  return response;
+}
+
+function handleGrassRPC(msg) {
+  if (!msg || !msg.action || !msg.id) return;
+  let result;
+  if (msg.action === 'AUTH') {
+    result = {
+      browser_id:   GRASS_BROWSER_ID,
+      user_id:      decodeGrassUserId(),
+      user_agent:   GRASS_UA,
+      timestamp:    Math.floor(Date.now() / 1000),
+      device_type:  'extension',
+      version:      GRASS_VERSION,
+      extension_id: GRASS_EXTENSION_ID
+    };
+    console.log('🔐 Grass Node: AUTH response sent');
+  } else if (msg.action === 'PONG') {
+    result = {};
+  } else {
+    return;
+  }
+  if (grassWs && grassWs.readyState === WebSocket.OPEN) {
+    grassWs.send(JSON.stringify({ id: msg.id, origin_action: msg.action, result }));
+  }
+}
+
+function startGrassPing() {
+  if (grassPingTimer) clearInterval(grassPingTimer);
+  grassPingTimer = setInterval(() => {
+    if (!grassWs || grassWs.readyState !== WebSocket.OPEN) return;
+    if (Date.now() - grassLastMsg > GRASS_DEAD_MS) {
+      console.error('⚠️  Grass Node: Tidak ada pesan selama 129 detik, reconnect...');
+      grassWs.terminate();
+      return;
+    }
+    grassWs.send(JSON.stringify({ id: uuidv4(), version: '1.0.0', action: 'PING', data: {} }));
+    console.log(`🏓 Grass Node: PING sent at ${new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })}`);
+  }, GRASS_PING_MS);
+}
+
+function scheduleGrassReconnect(delayMs = 30000) {
+  if (grassPingTimer)   clearInterval(grassPingTimer);
+  if (grassReconnTimer) clearTimeout(grassReconnTimer);
+  console.log(`🔄 Grass Node: Reconnect dalam ${delayMs / 1000} detik...`);
+  grassReconnTimer = setTimeout(connectGrassNode, delayMs);
+}
+
+async function connectGrassNode() {
+  if (!CONFIG.grassAuthToken) return;
+  try {
+    console.log('🔌 Grass Node: Checkin ke director...');
+    const checkin = await grassCheckin();
+    if (!checkin || !checkin.destinations || !checkin.token) {
+      console.error('❌ Grass Node: Checkin response tidak valid:', JSON.stringify(checkin));
+      scheduleGrassReconnect();
+      return;
+    }
+    const { destinations, token } = checkin;
+    const wsUrl = `ws://${destinations[0]}?token=${token}`;
+    console.log(`🔌 Grass Node: Connecting ke WebSocket (${destinations.length} destination)...`);
+    grassWs = new WebSocket(wsUrl, {
+      headers: {
+        'User-Agent': GRASS_UA,
+        'Origin': `chrome-extension://${GRASS_EXTENSION_ID}`
+      }
+    });
+    grassWs.on('open', () => {
+      grassLastMsg = Date.now();
+      console.log(`✅ Grass Node: WebSocket OPEN — Node aktif, earning uptime points!`);
+      startGrassPing();
+    });
+    grassWs.on('message', (data) => {
+      grassLastMsg = Date.now();
+      if (typeof data === 'string') {
+        try { handleGrassRPC(JSON.parse(data)); } catch {}
+      } else if (Buffer.isBuffer(data)) {
+        try { handleGrassRPC(JSON.parse(data.toString('utf8'))); } catch {}
+      }
+    });
+    grassWs.on('close', (code, reason) => {
+      console.log(`⚠️  Grass Node: WebSocket CLOSED (code=${code})`);
+      scheduleGrassReconnect();
+    });
+    grassWs.on('error', (err) => {
+      console.error(`❌ Grass Node: WebSocket error: ${err.message}`);
+      scheduleGrassReconnect();
+    });
+  } catch (error) {
+    console.error(`❌ Grass Node: ${error.message}`);
+    scheduleGrassReconnect();
   }
 }
 
@@ -621,6 +762,9 @@ console.log('');
 // Jalankan monitor & ping pertama kali langsung
 monitor();
 dawnPing();
+
+// Jalankan Grass Node (WebSocket — earn uptime points)
+connectGrassNode();
 
 // Set interval monitor (ambil data & notif Discord)
 setInterval(monitor, CONFIG.interval);
