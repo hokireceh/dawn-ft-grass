@@ -141,7 +141,8 @@ async function getGrassUser() {
     });
     return response.result.data;
   } catch (error) {
-    throw new Error(`Grass RetrieveUser Failed: ${error.message}`);
+    console.warn(`⚠️  Grass RetrieveUser: ${error.message}`);
+    return null;
   }
 }
 
@@ -683,6 +684,11 @@ async function monitorGrass() {
       getGrassActiveDevices(),
       getGrassEpochEarnings()
     ]);
+
+    if (!userData) {
+      console.warn('⚠️  Grass: Data user tidak tersedia (server error), skip cycle ini.');
+      return;
+    }
 
     displayGrassData(userData, devices, epochData);
 
